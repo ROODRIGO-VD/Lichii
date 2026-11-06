@@ -67,7 +67,20 @@ static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
            MakeCbufKey(index, offset);
 }
 
+// A descriptor with no format and no address is a null/unwritten TIC slot (or a bindless handle
+// that pointed outside the table). Its type field is 0, which reads as Texture1D; compiling the
+// shader for a 1D image and later binding a real 2D view to it faults the GPU on AMD drivers
+// (VK_ERROR_DEVICE_LOST). Assume the common case, a 2D texture.
+// EDEN_NX2_NULL_TIC_1D=1 restores the old behaviour for A/B tests.
+static bool IsNullTextureEntry(const Tegra::Texture::TICEntry& entry) {
+    return entry.format.Value() == Tegra::Texture::TextureFormat{} && entry.Address() == 0;
+}
+
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
+    static const bool legacy_null_1d = std::getenv("EDEN_NX2_NULL_TIC_1D") != nullptr;
+    if (!legacy_null_1d && IsNullTextureEntry(entry)) {
+        return Shader::TextureType::Color2D;
+    }
     switch (entry.texture_type) {
     case Tegra::Texture::TextureType::Texture1D:
         return Shader::TextureType::Color1D;
@@ -391,8 +404,18 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
                                                        gpu_memory->UsesNativeTiling())};
     ASSERT(index <= tic_limit);
+    Tegra::Texture::TICEntry entry{};
+    if (index > tic_limit) {
+        // Do not read past the end of the table: the bytes there are unrelated guest data.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(HW_GPU, "Texture handle {:#x} -> index {} beyond TIC limit {}, using a null "
+                        "2D texture (program={:#x} stage={})",
+                        raw, index, tic_limit, program_base, static_cast<u32>(stage));
+        }
+        return entry;
+    }
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
-    Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
